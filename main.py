@@ -37,7 +37,8 @@ def get_parser():
 
 if __name__ == '__main__':
     args = get_parser().parse_args()
-    config = getattr(configurations, args.config)()
+    config = configurations.base.copy()
+    config.update(getattr(configurations, args.config))
     for k, v in config.items():
         setattr(args, k, v)
 
@@ -67,7 +68,7 @@ if __name__ == '__main__':
     # TODO: nicer formatting?
     logger.info(model)
     param_count = sum([np.prod(p.size()) for p in model.parameters()])
-    logger.info('Model has {:,} parameters'.format(param_count))
+    logger.info('Model has {:,} parameters'.format(int(param_count)))
 
     # controller
     data_manager = DataManager(args)

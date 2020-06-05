@@ -23,3 +23,6 @@ ORG_WU = 1
 UPFLAT_WU = 2
 
 SEED = 147
+
+# following Attention is All You Need, we decode up to src_len + 50 tokens only
+DECODE_TOK_EXTRA_LIMIT = 50

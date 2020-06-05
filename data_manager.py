@@ -3,6 +3,7 @@ import numpy as np
 import torch
 import all_constants as ac
 import utils as ut
+import structs
 
 np.random.seed(ac.SEED)
 
@@ -11,6 +12,7 @@ class DataManager(object):
     def __init__(self, args):
         super(DataManager, self).__init__()
         self.args = args
+        self.struct = args.struct
         self.pairs = args.pairs.split(',')
         self.lang_vocab, self.lang_ivocab = ut.init_vocab(join(args.data_dir, 'lang.vocab'))
         self.vocab, self.ivocab = ut.init_vocab(join(args.data_dir, 'vocab.joint'))
@@ -55,9 +57,10 @@ class DataManager(object):
             src_file = join(data_dir, '{}/{}.{}.bpe'.format(pair, ac.DEV, src_lang))
             ref_file = join(data_dir, '{}/{}.{}'.format(pair, ac.DEV, tgt_lang))
             self.args.logger.info('Loading dev translate batches')
-            src_batches, sorted_idxs = self.get_translate_batches(src_file, batch_size=batch_size)
+            src_batches, sct_batches, sorted_idxs = self.get_translate_batches(src_file, batch_size=batch_size)
             self.translate_data[pair] = {
                 'src_batches': src_batches,
+                'sct_batches': sct_batches,
                 'sorted_idxs': sorted_idxs,
                 'ref_file': ref_file
             }
@@ -65,14 +68,15 @@ class DataManager(object):
     def get_batch(self):
         pair = np.random.choice(self.pairs, p=self.ps)
         try:
-            src, tgt, targets = next(self.train_iters[pair])
+            src, sct, tgt, targets = next(self.train_iters[pair])
         except StopIteration:
             self.train_iters[pair] = self.data[pair][ac.TRAIN].get_iter(shuffle=True)
-            src, tgt, targets = next(self.train_iters[pair])
+            src, sct, tgt, targets = next(self.train_iters[pair])
 
         src_lang, tgt_lang = pair.split('2')
         return {
             'src': src,
+            'sct': sct,
             'tgt': tgt,
             'targets': targets,
             'src_lang_idx': self.lang_vocab[src_lang],
@@ -86,11 +90,11 @@ class DataManager(object):
         lens = []
         with open(src_file, 'r') as fin:
             for line in fin:
-                toks = line.strip().split()
-                if toks:
-                    ids = [self.vocab.get(tok, ac.UNK_ID) for tok in toks] + [ac.EOS_ID]
-                    data.append(ids)
-                    lens.append(len(ids))
+                sct = self.struct.parse(line)
+                if sct:
+                    sct = sct.map(lambda tok: self.vocab.get(tok, ac.UNK_ID))
+                    data.append(sct)
+                    lens.append(sct.size())
 
         lens = np.array(lens)
         data = np.array(data)
@@ -100,6 +104,7 @@ class DataManager(object):
 
         # create batches
         src_batches = []
+        sct_batches = []
         s_idx = 0
         length = data.shape[0]
         while s_idx < length:
@@ -116,11 +121,12 @@ class DataManager(object):
             max_in_batch = max(lens[s_idx:e_idx])
             src = np.zeros((e_idx - s_idx, max_in_batch), dtype=np.int32)
             for i in range(s_idx, e_idx):
-                src[i - s_idx] = list(data[i]) + (max_in_batch - lens[i]) * [ac.PAD_ID]
+                src[i - s_idx] = data[i].flatten() + (max_in_batch - lens[i]) * [ac.PAD_ID]
             src_batches.append(torch.from_numpy(src).type(torch.long))
+            sct_batches.append(data[s_idx:e_idx])
             s_idx = e_idx
 
-        return src_batches, sorted_idxs
+        return src_batches, sct_batches, sorted_idxs
 
 
 class NMTDataset(object):
@@ -132,10 +138,10 @@ class NMTDataset(object):
         self.batch_size = batch_size
         self.batches = []
 
-        sorted_idxs = np.argsort([len(x) for x in src])
+        sorted_idxs = np.argsort([x.size() for x in src])
         src = src[sorted_idxs]
         tgt = tgt[sorted_idxs]
-        src_lens = [len(x) for x in src]
+        src_lens = [x.size() for x in src]
         tgt_lens = [len(x) for x in tgt]
 
         # prepare batches
@@ -176,14 +182,14 @@ class NMTDataset(object):
         target_batch = np.zeros([num_sents, max_tgt_len], dtype=np.int32)
 
         for i in range(num_sents):
-            src_batch[i] = src[i] + (max_src_len - src_lens[i]) * [ac.PAD_ID]
+            src_batch[i] = src[i].flatten() + (max_src_len - src_lens[i]) * [ac.PAD_ID]
             tgt_batch[i] = tgt[i] + (max_tgt_len - tgt_lens[i]) * [ac.PAD_ID]
             target_batch[i] = tgt[i][1:] + [ac.EOS_ID] + (max_tgt_len - tgt_lens[i]) * [ac.PAD_ID]
 
         src_batch = torch.from_numpy(src_batch).type(torch.long)
         tgt_batch = torch.from_numpy(tgt_batch).type(torch.long)
         target_batch = torch.from_numpy(target_batch).type(torch.long)
-        return src_batch, tgt_batch, target_batch
+        return src_batch, src, tgt_batch, target_batch
 
     def get_iter(self, shuffle=False):
         if shuffle:

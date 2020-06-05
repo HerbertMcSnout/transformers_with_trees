@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from layers import Encoder, Decoder
 import utils as ut
 import all_constants as ac
-
+import structs
 
 class Transformer(nn.Module):
     """Transformer https://arxiv.org/pdf/1706.03762.pdf"""
@@ -14,12 +14,15 @@ class Transformer(nn.Module):
         super(Transformer, self).__init__()
         self.args = args
 
+        self.args.pos_norm_scale = self.args.pos_norm_scale(self.args)
+
         embed_dim = args.embed_dim
         fix_norm = args.fix_norm
         joint_vocab_size = args.joint_vocab_size
         lang_vocab_size = args.lang_vocab_size
         use_bias = args.use_bias
-        self.scale = embed_dim ** 0.5
+        self.src_embed_scale = Parameter(torch.tensor([embed_dim ** 0.5]))
+        self.tgt_embed_scale = Parameter(torch.tensor([embed_dim ** 0.5]))
 
         if args.mask_logit:
             # mask logits separately per language
@@ -35,6 +38,10 @@ class Transformer(nn.Module):
         self.word_embedding = Parameter(torch.Tensor(joint_vocab_size, embed_dim))
         self.lang_embedding = Parameter(torch.Tensor(lang_vocab_size, embed_dim))
         self.out_bias = Parameter(torch.Tensor(joint_vocab_size)) if use_bias else None
+        struct_params = self.args.struct.get_params(args)
+        for name, x in struct_params.items():
+            self.register_parameter(name, Parameter(x))
+        self.struct_params = struct_params.values()
 
         self.encoder = Encoder(args)
         self.decoder = Decoder(args)
@@ -50,6 +57,13 @@ class Transformer(nn.Module):
         if use_bias:
             nn.init.constant_(self.out_bias, 0.)
 
+        # dict where keys are data_ptrs to dicts of parameter options
+        # see https://pytorch.org/docs/stable/optim.html#per-parameter-options
+        self.parameter_attrs = {
+            self.src_embed_scale.data_ptr():{'lr':self.args.embed_scale_lr},
+            self.tgt_embed_scale.data_ptr():{'lr':self.args.embed_scale_lr}
+        }
+
     def replace_with_unk(self, toks):
         # word-dropout
         p = self.args.word_dropout
@@ -59,26 +73,41 @@ class Transformer(nn.Module):
             mask = mask & non_pad_mask
             toks[mask] = ac.UNK_ID
 
-    def get_input(self, toks, lang_idx, word_embedding, pos_embedding):
+    def get_input(self, toks, lang_idx, word_embedding, word_scale, pos_embed):
         # word dropout, but replace with unk instead of zero-ing embed
         self.replace_with_unk(toks)
-        word_embed = F.embedding(toks, word_embedding) * self.scale # [bsz, len, dim]
-        lang_embed = self.lang_embedding[lang_idx].unsqueeze(0).unsqueeze(1) # [1, 1, dim]
-        pos_embed = pos_embedding[:toks.size(-1), :].unsqueeze(0) # [1, len, dim]
+        word_embed = F.embedding(toks, word_embedding) * word_scale # [bsz, max_len, embed_dim]
+        lang_embed = self.lang_embedding[lang_idx].unsqueeze(0).unsqueeze(1) # [1, 1, embed_dim]
+
+        if pos_embed.size(1) != toks.size(-1):
+            pos_embed = pos_embed[:, :toks.size(-1), :] # [1 or bsz, max_len, embed_dim]
 
         return word_embed + lang_embed + pos_embed
 
-    def forward(self, src, tgt, targets, src_lang_idx, tgt_lang_idx, logit_mask):
+    def get_src_pos_embedding(self, sct, embed_dim, max_len):
+        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        pos_embeds = [x.get_pos_embedding(embed_dim, self.struct_params).flatten() for x in sct]
+        pos_embeds = [[x.to(device) for x in xs] for xs in pos_embeds]
+        pos_embeds = [x + [torch.zeros(embed_dim).to(device)] * (max_len - len(x)) for x in pos_embeds]
+        pos_embeds = [torch.stack(x) for x in pos_embeds] # list of [max_len, embed_dim]
+        pos_embeds = torch.stack(pos_embeds) # [bsz, max_len, embed_dim]
+        return pos_embeds
+
+    def get_tgt_pos_embedding(self, embed_dim, max_len):
+        return ut.get_positional_encoding(embed_dim, max_len).unsqueeze(0)
+
+    def forward(self, src, sct, tgt, targets, src_lang_idx, tgt_lang_idx, logit_mask):
         embed_dim = self.args.embed_dim
         max_len = max(src.size(1), tgt.size(1))
-        pos_embedding = ut.get_positional_encoding(embed_dim, max_len)
+        src_pos_embedding = self.get_src_pos_embedding(sct, embed_dim, max_len) # [bsz, max_len, embed_dim]
+        tgt_pos_embedding = self.get_tgt_pos_embedding(embed_dim, max_len) # [1, max_len, embed_dim]
         word_embedding = F.normalize(self.word_embedding, dim=-1) if self.args.fix_norm else self.word_embedding
 
-        encoder_inputs = self.get_input(src, src_lang_idx, word_embedding, pos_embedding)
+        encoder_inputs = self.get_input(src, src_lang_idx, word_embedding, self.src_embed_scale, src_pos_embedding * self.args.pos_norm_scale)
         encoder_mask = (src == ac.PAD_ID).unsqueeze(1).unsqueeze(2)
         encoder_outputs = self.encoder(encoder_inputs, encoder_mask)
 
-        decoder_inputs = self.get_input(tgt, tgt_lang_idx, word_embedding, pos_embedding)
+        decoder_inputs = self.get_input(tgt, tgt_lang_idx, word_embedding, self.tgt_embed_scale, tgt_pos_embedding)
         decoder_mask = torch.triu(torch.ones((tgt.size(-1), tgt.size(-1))), diagonal=1).type(tgt.type()) == 1
         decoder_mask = decoder_mask.unsqueeze(0).unsqueeze(1)
         decoder_outputs = self.decoder(decoder_inputs, decoder_mask, encoder_outputs, encoder_mask)
@@ -101,6 +130,11 @@ class Transformer(nn.Module):
         else:
             loss = nll_loss
 
+        # Penalize position embeddings that have (pre-scaled) norms greater than 1
+        pe_norms = src_pos_embedding.norm(dim=2) # [bsz, max_len]
+        pe_errs = torch.clamp(pe_norms - 1, min=0)
+        loss += pe_errs.sum(dim=[0,1]) * self.args.pos_norm_penalty
+
         num_words = non_pad_mask.type(loss.type()).sum()
         opt_loss = loss / num_words
         return {
@@ -116,27 +150,27 @@ class Transformer(nn.Module):
         logits[:, ~logit_mask] = -1e9
         return logits
 
-    def beam_decode(self, src, src_lang_idx, tgt_lang_idx, logit_mask):
+    def beam_decode(self, src, sct, src_lang_idx, tgt_lang_idx, logit_mask):
         embed_dim = self.args.embed_dim
-        max_len = src.size(1) + 51
-        pos_embedding = ut.get_positional_encoding(embed_dim, max_len)
+        max_len = src.size(1) + ac.DECODE_TOK_EXTRA_LIMIT + 1
+        src_pos_embedding = self.get_src_pos_embedding(sct, embed_dim, max_len) * self.args.pos_norm_scale
+        tgt_pos_embedding = self.get_tgt_pos_embedding(embed_dim, max_len)
         word_embedding = F.normalize(self.word_embedding, dim=-1) if self.args.fix_norm else self.word_embedding
         logit_mask = logit_mask == 1 if self.logit_mask is None else self.logit_mask
         tgt_lang_embed = self.lang_embedding[tgt_lang_idx]
 
-        encoder_inputs = self.get_input(src, src_lang_idx, word_embedding, pos_embedding)
+        encoder_inputs = self.get_input(src, src_lang_idx, word_embedding, self.src_embed_scale, src_pos_embedding)
         encoder_mask = (src == ac.PAD_ID).unsqueeze(1).unsqueeze(2)
         encoder_outputs = self.encoder(encoder_inputs, encoder_mask)
 
         def get_tgt_inp(tgt, time_step):
-            word_embed = F.embedding(tgt.type(src.type()), word_embedding) * self.scale
-            pos_embed = pos_embedding[time_step, :].reshape(1, 1, -1)
+            word_embed = F.embedding(tgt.type(src.type()), word_embedding) * self.tgt_embed_scale
+            pos_embed = tgt_pos_embedding[:, time_step, :]#.reshape(1, 1, -1)
             return word_embed + tgt_lang_embed + pos_embed
 
         def logprob_fn(decoder_output):
             logits = self.logit_fn(decoder_output, word_embedding, logit_mask)
             return F.log_softmax(logits, dim=-1)
 
-        # following Attention is all you need, we decode up to src_len + 50 tokens only
-        max_lengths = torch.sum(src != ac.PAD_ID, dim=-1).type(src.type()) + 50
+        max_lengths = torch.sum(src != ac.PAD_ID, dim=-1).type(src.type()) + ac.DECODE_TOK_EXTRA_LIMIT
         return self.decoder.beam_decode(encoder_outputs, encoder_mask, get_tgt_inp, logprob_fn, ac.BOS_ID, ac.EOS_ID, max_lengths, beam_size=self.args.beam_size, alpha=self.args.beam_alpha)

@@ -25,12 +25,17 @@ def get_parser():
                         help='number of BPE operations')
     parser.add_argument('--max-vocab-size', type=int, default=0,
                         help='maximum vocab size')
+    parser.add_argument('--src-struct', type=str, default='sequence',
+                        help='src structure, name of a module in structs/')
     return parser
 
 
 if __name__ == '__main__':
     args = get_parser().parse_args()
 
+    import structs
+    struct = getattr(structs, args.src_struct)
+    
     data_dir = args.data_dir
     pairs = args.pairs.split(',')
     langs = []
@@ -155,7 +160,7 @@ if __name__ == '__main__':
             infile = join(data_dir, '{}/train.{}.bpe'.format(pair, lang))
             with open(infile, 'r') as fin:
                 for line in fin:
-                    toks = line.strip().split()
+                    toks = line.strip().split() # TODO?
                     if toks:
                         joint_vocab.update(toks)
                         sub_vocabs[lang].update(toks)
@@ -200,13 +205,13 @@ if __name__ == '__main__':
             tgt_infile = join(data_dir, '{}/{}.{}.bpe'.format(pair, mode, tgt_lang))
             with open(src_infile, 'r') as f_src, open(tgt_infile, 'r') as f_tgt:
                 for src_line, tgt_line in zip(f_src, f_tgt):
-                    src_toks = src_line.strip().split()
+                    src_prsd = struct.parse(src_line)
                     tgt_toks = tgt_line.strip().split()
 
-                    if src_toks and tgt_toks:
-                        src_toks = [joint_vocab.get(tok, ac.UNK_ID) for tok in src_toks] + [ac.EOS_ID]
+                    if src_prsd and tgt_toks:
+                        src_prsd = src_prsd.map(lambda tok: joint_vocab.get(tok, ac.UNK_ID))
                         tgt_toks = [ac.BOS_ID] + [joint_vocab.get(tok, ac.UNK_ID) for tok in tgt_toks]
-                        src_data.append(src_toks)
+                        src_data.append(src_prsd)
                         tgt_data.append(tgt_toks)
 
             src_data = np.array(src_data)

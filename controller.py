@@ -37,7 +37,18 @@ class Controller(object):
         self.max_epochs = args.max_epochs
 
         self.model.to(self.device)
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
+
+        params = []
+        for p in self.model.parameters():
+            ptr = p.data_ptr()
+            d = {'params': [p]}
+            if ptr in self.model.parameter_attrs:
+                attrs = self.model.parameter_attrs[ptr]
+                for k in attrs:
+                    d[k] = attrs[k]
+            params.append(d)
+
+        self.optimizer = torch.optim.Adam(params, lr=self.lr)
 
         # logging
         self.log_freq = args.log_freq
@@ -118,6 +129,7 @@ class Controller(object):
 
         batch_data = self.data_manager.get_batch()
         src = batch_data['src']
+        sct = batch_data['sct']
         tgt = batch_data['tgt']
         targets = batch_data['targets']
         src_lang_idx = batch_data['src_lang_idx']
@@ -133,7 +145,7 @@ class Controller(object):
         targets_cuda = targets.to(self.device, non_blocking=True)
         logit_mask_cuda = logit_mask.to(self.device, non_blocking=True)
         # run
-        ret = self.model(src_cuda, tgt_cuda, targets_cuda, src_lang_idx, tgt_lang_idx, logit_mask_cuda)
+        ret = self.model(src_cuda, sct, tgt_cuda, targets_cuda, src_lang_idx, tgt_lang_idx, logit_mask_cuda)
         opt_loss = ret['opt_loss']
         # back-prob
         opt_loss.backward()
@@ -304,13 +316,13 @@ class Controller(object):
                 weight = 0.
 
                 it = self.data_manager.data[pair][ac.DEV].get_iter()
-                for src, tgt, targets in it:
+                for src, sct, tgt, targets in it:
                     src_cuda = src.to(self.device)
                     tgt_cuda = tgt.to(self.device)
                     targets_cuda = targets.to(self.device)
                     logit_mask_cuda = self.data_manager.logit_masks[tgt_lang].to(self.device)
 
-                    ret = self.model(src_cuda, tgt_cuda, targets_cuda, src_lang_idx, tgt_lang_idx, logit_mask_cuda)
+                    ret = self.model(src_cuda, sct, tgt_cuda, targets_cuda, src_lang_idx, tgt_lang_idx, logit_mask_cuda)
                     loss += ret['loss'].item()
                     nll_loss += ret['nll_loss'].item()
                     weight += ret['num_words'].item()
@@ -341,10 +353,11 @@ class Controller(object):
                 logit_mask = self.data_manager.logit_masks[tgt_lang]
                 data = self.data_manager.translate_data[pair]
                 src_batches = data['src_batches']
+                sct_batches = data['sct_batches']
                 sorted_idxs = data['sorted_idxs']
                 ref_file = data['ref_file']
 
-                all_best_trans, all_beam_trans = self._translate(src_batches, sorted_idxs, src_lang_idx, tgt_lang_idx, logit_mask)
+                all_best_trans, all_beam_trans = self._translate(src_batches, sct_batches, sorted_idxs, src_lang_idx, tgt_lang_idx, logit_mask)
 
                 all_best_trans = ''.join(all_best_trans)
                 best_trans_file = join(dump_dir, '{}_val_trans.txt.bpe'.format(pair))
@@ -403,7 +416,7 @@ class Controller(object):
 
         return best_trans, '\n'.join(beam_trans)
 
-    def _translate(self, src_batches, sorted_idxs, src_lang_idx, tgt_lang_idx, logit_mask):
+    def _translate(self, src_batches, sct_batches, sorted_idxs, src_lang_idx, tgt_lang_idx, logit_mask):
         all_best_trans = [''] * sorted_idxs.shape[0]
         all_beam_trans = [''] * sorted_idxs.shape[0]
 
@@ -411,10 +424,12 @@ class Controller(object):
         count = 0
         self.model.eval()
         with torch.no_grad():
-            for src in src_batches:
+            for i in range(len(src_batches)):
+                src = src_batches[i]
+                sct = sct_batches[i]
                 src_cuda = src.to(self.device)
                 logit_mask = logit_mask.to(self.device)
-                ret = self.model.beam_decode(src_cuda, src_lang_idx, tgt_lang_idx, logit_mask)
+                ret = self.model.beam_decode(src_cuda, sct, src_lang_idx, tgt_lang_idx, logit_mask)
                 for x in ret:
                     probs = x['probs'].cpu().detach().numpy().reshape([-1])
                     scores = x['scores'].cpu().detach().numpy().reshape([-1])
@@ -433,11 +448,11 @@ class Controller(object):
         return all_best_trans, all_beam_trans
 
     def translate(self, src_file, src_lang, tgt_lang, batch_size=4096):
-        src_batches, sorted_idxs = self.data_manager.get_translate_batches(src_file, batch_size=batch_size)
+        src_batches, sct_batches, sorted_idxs = self.data_manager.get_translate_batches(src_file, batch_size=batch_size)
         src_lang_idx = self.data_manager.lang_vocab[src_lang]
         tgt_lang_idx = self.data_manager.lang_vocab[tgt_lang]
         logit_mask = self.data_manager.logit_masks[tgt_lang]
-        all_best_trans, all_beam_trans = self._translate(src_batches, sorted_idxs, src_lang_idx, tgt_lang_idx, logit_mask)
+        all_best_trans, all_beam_trans = self._translate(src_batches, sct_batches, sorted_idxs, src_lang_idx, tgt_lang_idx, logit_mask)
 
         # write to file
         all_best_trans = ''.join(all_best_trans)
